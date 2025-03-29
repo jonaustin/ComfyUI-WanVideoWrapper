@@ -28,7 +28,7 @@ def rope_riflex(pos, dim, theta, L_test, k, temporal):
     else:
         device = pos.device
 
-    scale = torch.linspace(0, (dim - 2) / dim, steps=dim//2, dtype=torch.float64, device=device)
+    scale = torch.linspace(0, (dim - 2) / dim, steps=dim//2, dtype=torch.float32, device=device)
     omega = 1.0 / (theta**scale)
 
     # RIFLEX modification - adjust last frequency component if L_test and k are provided
@@ -67,7 +67,7 @@ def sinusoidal_embedding_1d(dim, position):
     # preprocess
     assert dim % 2 == 0
     half = dim // 2
-    position = position.type(torch.float64)
+    position = position.type(torch.float32)  # Changed from float32 to float32
 
     # calculation
     sinusoid = torch.outer(
@@ -75,10 +75,22 @@ def sinusoidal_embedding_1d(dim, position):
     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
     return x
 
+# def sinusoidal_embedding_1d(dim, position):
+#     # preprocess
+#     assert dim % 2 == 0
+#     half = dim // 2
+#     position = position.type(torch.float32)
+#
+#     # calculation
+#     sinusoid = torch.outer(
+#         position, torch.pow(10000, -torch.arange(half).to(position).div(half)))
+#     x = torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1)
+#     return x
+
 
 def rope_params(max_seq_len, dim, theta=10000, L_test=25, k=0):
     assert dim % 2 == 0
-    exponents = torch.arange(0, dim, 2, dtype=torch.float64).div(dim)
+    exponents = torch.arange(0, dim, 2, dtype=torch.float32).div(dim)
     inv_theta_pow = 1.0 / torch.pow(theta, exponents)
     
     if k > 0:
@@ -104,7 +116,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -807,15 +819,31 @@ class WanModel(ModelMixin, ConfigMixin):
         if control_lora_enabled:
             self.expanded_patch_embedding.to(device)
             x = [
-            self.expanded_patch_embedding(u.unsqueeze(0))
-            for u in x
+                # Convert input to match weight/bias dtype
+                self.expanded_patch_embedding(u.unsqueeze(0).to(self.expanded_patch_embedding.weight.dtype))
+                for u in x
             ]
         else:
             self.original_patch_embedding.to(self.main_device)
             x = [
-            self.original_patch_embedding(u.unsqueeze(0))
-            for u in x
+                # Convert input to match weight/bias dtype
+                self.original_patch_embedding(u.unsqueeze(0).to(self.original_patch_embedding.weight.dtype))
+                for u in x
             ]
+
+
+        # if control_lora_enabled:
+        #     self.expanded_patch_embedding.to(device)
+        #     x = [
+        #     self.expanded_patch_embedding(u.unsqueeze(0))
+        #     for u in x
+        #     ]
+        # else:
+        #     self.original_patch_embedding.to(self.main_device)
+        #     x = [
+        #     self.original_patch_embedding(u.unsqueeze(0))
+        #     for u in x
+        #     ]
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
@@ -843,11 +871,28 @@ class WanModel(ModelMixin, ConfigMixin):
             rope_func = "default"
 
         # time embeddings
+        # with torch.autocast(device_type='cuda', dtype=torch.float32):
+        #     e = self.time_embedding(
+        #         sinusoidal_embedding_1d(self.freq_dim, t).float())
+        #     e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+        #     assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
         with torch.autocast(device_type='cuda', dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
+            e = e.to(torch.float32)  # Force to float32
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+            e0 = e0.to(torch.float32)  # Force to float32
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
+        # This is a much better fix, but it reliably doesn't work (Comfyui "Reconnecting" error)
+        # time embeddings
+        # device_type = 'mps' if x[0].device.type == 'mps' else 'cuda'
+        # with torch.autocast(device_type=device_type, dtype=torch.float32, enabled=False):
+        #     e = self.time_embedding(
+        #             sinusoidal_embedding_1d(self.freq_dim, t).float()).to(torch.float32)
+        #     e0 = self.time_projection(e).unflatten(1, (6, self.dim)).to(torch.float32)
+        #     assert e.dtype == torch.float32 and e0.dtype == torch.float32
 
         # context
         context_lens = None
